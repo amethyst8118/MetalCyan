@@ -62,10 +62,43 @@ in boot-args as well.
 | `bc250gputemp=N` | GPU temperature at which the forced GPU clock is released, 50-100 °C (default 90). |
 | `bc250cores=8` | Ask the SMU for all 8 cores; they'd show up after a Restart. Untested; use the OpenCore driver in the EFI repo instead. |
 | `bc250smu=0` | No SMU access at all (no telemetry, no tuning). |
+| `bc250fan=0` | No fan monitoring or control. |
+| `bc250fanpct=N` | Fixed fan duty, 30-100%. Takes over the spinning fans after 60 s. |
+| `bc250fancurve=1` | Fan duty follows CPU Tctl: floor at or below 50 °C, 100% at 80 °C. |
+| `bc250fanmin=N` | Curve floor, 20-100% (default 30). |
 
 Clocks and voltages are applied 60 seconds after boot, so a bad setting can't stop the machine from booting: you can
 always get to the desktop and take it out again. If the SMU stops responding (telemetry frozen, CPU stuck at one
 clock), remove the setting and power off for 10 seconds. A restart isn't enough.
+
+## Fans
+
+> [!WARNING]
+> Fan monitoring and especially control are **untested on the board**. Monitoring only reads; control is
+> strictly opt-in. If anything looks wrong, boot with `bc250fan=0` (or remove the control boot-args).
+
+The board's Super I/O is a **Nuvoton NCT6686D**. MetalCyan probes it once (config port 0x2E, then 0x4E) and,
+when found, reads fan speeds and duties every second into `sysctl -n debug.bc250.smu`
+(`| fans 0/1589/0/0/0 rpm pwm 96/96/96/96/96%`, channels 0-4, plus `nct` temperatures when the EC
+descriptors identify them) and the `BC250,SMU` property (`Fan Speed (RPM)`, `Fan PWM (%)`, `NCT Temp (0.1 C)`).
+The wired header is **CPU_FAN1 = EC channel 1 = BIOS fan 1** (the only one spinning in Linux recon, as `fan2`).
+Fan telemetry lives in the SMU thread, so `bc250smu=0` turns it off too.
+
+Control needs `bc250fanpct=N` (fixed duty, `bc250fanpct` wins if both are given) or `bc250fancurve=1` (duty
+follows CPU Tctl from the `bc250fanmin` floor, default 30%, at or below 50 °C to 100% at 80 °C). It drives
+only the channels spinning when it starts (logged), and only after the same 60 s delay as the clock tuning,
+so a bad setting can't stop the machine from booting. Safety rules: Tctl at or above 85 °C forces 100% on
+the controlled channels; an EC handshake timeout or a controlled channel reading 0 RPM three polls running
+hands every controlled channel back to the firmware and latches control off for the rest of the boot. Duties
+are re-sent only on change but re-asserted every 10 s in case the EC reclaims them. Out-of-range boot-args
+are logged and ignored.
+
+macOS fan apps (Macs Fan Control etc.) can't drive these fans: VirtualSMC's SMCSuperIO only *reads* Nuvoton
+chips, it registers no control keys for them. Don't add SMCSuperIO alongside this either: two drivers on the
+same Super I/O ports and EC window corrupt each other's accesses.
+
+Register facts from [Fred78290/nct6687d](https://github.com/Fred78290/nct6687d) and Linux's `nct6683` driver;
+no code copied from either (both GPL-2.0).
 
 ## Logs
 

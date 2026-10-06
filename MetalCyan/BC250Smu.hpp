@@ -24,6 +24,7 @@
 //                        Released (0x3A/0x3C, firmware control) if Tctl passes bc250gputemp (default 90 C).
 
 #pragma once
+#include <BC250Fan.hpp>
 #include <IOKit/IOLocks.h>
 #include <IOKit/IOTypes.h>
 
@@ -85,6 +86,7 @@ private:
     IOLock*      lock {nullptr};
     Telemetry    last {};
     bool         started {false};
+    BC250Fan     fan {};
 
     bool   findHostBridge();
     UInt32 smnRead(UInt32 address);

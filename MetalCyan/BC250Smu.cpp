@@ -460,6 +460,7 @@ size_t BC250Smu::describe(char* out, size_t capacity) const
     if (t.gpuBusyValid && n > 0 && static_cast<size_t>(n) < capacity) {
         n += snprintf(out + n, capacity - n, " | GPU busy %u%%", t.gpuBusyPercent);
     }
+    if (n > 0 && static_cast<size_t>(n) < capacity) { n += this->fan.describeAppend(out + n, capacity - n); }
     return n > 0 ? static_cast<size_t>(n) : 0;
 }
 
@@ -509,6 +510,7 @@ void BC250Smu::publish(const Telemetry& t)
             dict->setObject("P-state Clocks (MHz)", pstates);
             pstates->release();
         }
+        this->fan.publish(dict);
         gpu->setProperty("BC250,SMU", dict);
     }
     if (dict != nullptr) { dict->release(); }
@@ -540,6 +542,8 @@ void BC250Smu::run()
         BCLOG("BC250SMU", "host bridge 00:00.0 not found; no SMU telemetry");
         return;
     }
+    // NCT6686D fan monitoring (and opt-in control): its own probe, skipped entirely with bc250fan=0.
+    this->fan.detect();
     this->parseTune();
     Telemetry t {};
     this->poll(t);
@@ -567,6 +571,8 @@ void BC250Smu::run()
         const SInt32 busy = this->sampleGpuBusy();
         Telemetry now = this->last;
         this->poll(now);
+        // Fan RPM/PWM (+ EC temperatures) beside the SMU poll; control runs on Tctl inside.
+        this->fan.poll(now.tctlDeciC, now.valid);
         now.gpuBusyValid   = busy >= 0;
         now.gpuBusyPercent = busy >= 0 ? static_cast<UInt32>(busy) : 0;
         const bool changed = now.gfxClockMHz != this->last.gfxClockMHz || now.coreMask != this->last.coreMask ||
