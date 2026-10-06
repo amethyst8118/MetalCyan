@@ -23,11 +23,15 @@ static const char bc250_com_apple_kext_AMDRadeonX6000Framebuffer[] = {
 static const char bc250_com_apple_kext_AMDRadeonX6000HWServices[] = {
 #embed "Personalities/BC250/com.apple.kext.AMDRadeonX6000HWServices.xml" suffix(, '\0')
 };
+static const char bc250_com_apple_driver_AppleGFXHDA[] = {
+#embed "Personalities/BC250/com.apple.driver.AppleGFXHDA.xml" suffix(, '\0')
+};
 
 DriverInjector::DriverInjector() :
     bc250Drivers{
         Driver("com.apple.kext.AMDRadeonX6000Framebuffer", bc250_com_apple_kext_AMDRadeonX6000Framebuffer),
         Driver("com.apple.kext.AMDRadeonX6000HWServices", bc250_com_apple_kext_AMDRadeonX6000HWServices),
+        Driver("com.apple.driver.AppleGFXHDA", bc250_com_apple_driver_AppleGFXHDA),
     }
 { }
 
@@ -94,8 +98,8 @@ bool DriverInjector::wrapAddDrivers(void* const self, OSArray* const array, cons
         if (bundleIdentifier == nullptr || bundleIdentifier->getLength() == 0) { continue; }
 
         Driver* toInject = singleton().bc250Drivers;
-        // The framebuffer and HWServices.
-        size_t toInjectCount = BC250::singleton().isActive() ? 2 : 0;
+        // The framebuffer, HWServices and AppleGFXHDA.
+        size_t toInjectCount = BC250::singleton().isActive() ? 3 : 0;
         for (size_t identifierIndex = 0; identifierIndex < toInjectCount; identifierIndex += 1) {
             auto& driver = toInject[identifierIndex];
 

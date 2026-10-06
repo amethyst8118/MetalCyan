@@ -4,6 +4,7 @@
 // See LICENSE for details.
 
 #include <AGDP.hpp>
+#include <AppleGFXHDA.hpp>
 #include <BC250.hpp>
 #include <BC250HWL.hpp>
 #include <DriverInjector.hpp>
@@ -45,7 +46,7 @@ void NRed::init()
     lilu.onKextLoadForce(&kextRadeonX6000HWLibs);
     lilu.onKextLoadForce(&kextRadeonX6000);
     lilu.onKextLoadForce(&kextAGDP);
-
+    lilu.onKextLoadForce(&kextAppleGFXHDA);
     lilu.onPatcherLoadForce(
         [](void* const, KernelPatcher& patcher)
         {
@@ -62,6 +63,7 @@ void NRed::init()
             AGDP::singleton().processKext(patcher, id, slide, size);
             X6000FB::singleton().processKext(patcher, id, slide, size);
             BC250HWL::singleton().processKext(patcher, id, slide, size);
+            AppleGFXHDA::singleton().processKext(patcher, id, slide, size);
         },
         nullptr);
 }

@@ -39,7 +39,7 @@ class DriverInjector
     mach_vm_address_t orgAddDrivers{0};
     UInt8             matchedDrivers{0};
     bool              bc250AccelInjected{false};
-    Driver            bc250Drivers[2];    // The framebuffer and HWServices.
+    Driver            bc250Drivers[3];    // The framebuffer, HWServices and AppleGFXHDA.
 
 public:
     DriverInjector();

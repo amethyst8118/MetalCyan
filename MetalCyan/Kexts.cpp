@@ -15,6 +15,7 @@ static const char* pathRadeonX6000HWLibs = "/System/Library/Extensions/AMDRadeon
 static const char* pathRadeonX6000 = "/System/Library/Extensions/AMDRadeonX6000.kext/Contents/MacOS/AMDRadeonX6000";
 static const char* pathAGDP        = "/System/Library/Extensions/AppleGraphicsControl.kext/Contents/PlugIns/"
                                      "AppleGraphicsDevicePolicy.kext/Contents/MacOS/AppleGraphicsDevicePolicy";
+static const char* pathAppleGFXHDA = "/System/Library/Extensions/AppleGFXHDA.kext/Contents/MacOS/AppleGFXHDA";
 
 KernelPatcher::KextInfo kextRadeonX6000Framebuffer{
     "com.apple.kext.AMDRadeonX6000Framebuffer", &pathRadeonX6000Framebuffer, 1, {true}, {},
@@ -36,4 +37,8 @@ KernelPatcher::KextInfo kextRadeonX6000{
 
 KernelPatcher::KextInfo kextAGDP{
     "com.apple.driver.AppleGraphicsDevicePolicy", &pathAGDP, 1, {true}, {}, KernelPatcher::KextInfo::Unloaded,
+};
+
+KernelPatcher::KextInfo kextAppleGFXHDA{
+    "com.apple.driver.AppleGFXHDA", &pathAppleGFXHDA, 1, {true}, {}, KernelPatcher::KextInfo::Unloaded,
 };

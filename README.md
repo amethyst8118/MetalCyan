@@ -24,8 +24,13 @@ For a complete EFI, see [BC-250-Hackintosh-OpenCore](https://github.com/amethyst
 
 - **Hardware video decode/encode.** VCN can't be used on this chip, so macOS decodes in software. 4K video plays fine
   in Firefox.
-- **HDMI/DP audio.** The GPU's audio function isn't set up yet. Safari and the TV app refuse to play video without an
-  audio output device; a virtual one (BlackHole etc.) gets around it.
+- **HDMI/DP audio.** MetalCyan injects an AppleGFXHDA personality for the GPU's audio function
+  (1002:13FF), renames its node to HDAU with `built-in` and `hda-gfx=onboard-1`, and forces the
+  Tahiti function group / 1002AAA0 widget for its ATI HDMI codec. Untested on the board. DP audio
+  may drift out of sync — Linux needed `ignore_dpref_ss` on this chip (upstream `ff209cd04845`).
+  Don't combine with an EFI device-id spoof of the audio function. Safari and the TV app refuse to
+  play video without an audio output device; a virtual one (BlackHole etc.) still gets around it
+  if no HDMI/DP output shows up.
 - **GPU recovery.** Apple's reset path is Navi 10's and hangs this GPU, so it's blocked. If the GPU hangs, the screen
   freezes until you reboot. It hasn't happened since the VRAM fixes, but there's no way back from it.
 - **Shutdown/restart.** WindowServer panics on the way down (`display_mode_did_change ... returns false`). It doesn't
