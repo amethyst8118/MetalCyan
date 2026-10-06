@@ -525,6 +525,20 @@ namespace
         if (function == kControllerReleaseServices && accelInStart) { return kIOReturnSuccess; }
         return FunctionCast(wrapControllerDrvrFunction, orgControllerDrvrFunction)(controller, function, p1, p2, p3);
     }
+    // Shutdown/restart panics in IOAccelDisplayMachine::display_mode_did_change when this returns false (26.7.1:
+    // its only false source is set_display_mode_and_vram's scanout VRAM allocation failing, which already calls
+    // resetTempBuffersAndVblankFlips). Retry once; success path unchanged. Untested.
+    mach_vm_address_t orgDisplayModeDidChange = 0;
+
+    bool wrapDisplayModeDidChange(void* self)
+    {
+        bool ret = FunctionCast(wrapDisplayModeDidChange, orgDisplayModeDidChange)(self);
+        if (ret) { return ret; }
+        BCLOG("BC250HWL", "displayModeDidChange failed (scanout VRAM); retrying once");
+        ret = FunctionCast(wrapDisplayModeDidChange, orgDisplayModeDidChange)(self);
+        BCLOG("BC250HWL", "displayModeDidChange retry: %d", ret);
+        return ret;
+    }
 
     // GPU statistics for the usual monitoring tools (Activity Monitor, iStat, HWMonitor), which read the
     // accelerator's "PerformanceStatistics". AMDHardware::publishPMStatistics(dict, bool) copies PowerPlay's values
@@ -3025,6 +3039,14 @@ void BC250HWL::processKext(KernelPatcher& patcher, size_t id, mach_vm_address_t 
             BCLOG("BC250HWL", "accelerator stop guard not installed; the accelerator does not start");
             patcher.clearError();
             accelStopUnguarded = true;
+        }
+    }
+    if (kext == Kext::Accel) {
+        KernelPatcher::RouteRequest request {"__ZN37AMDRadeonX6000_AMDAccelDisplayMachine20displayModeDidChangeEv",
+            wrapDisplayModeDidChange, orgDisplayModeDidChange};
+        if (!patcher.routeMultiple(id, &request, 1, slide, size) || orgDisplayModeDidChange == 0) {
+            BCLOG("BC250HWL", "displayModeDidChange retry not installed; shutdown panic unchanged");
+            patcher.clearError();
         }
     }
 

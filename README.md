@@ -29,7 +29,7 @@ For a complete EFI, see [BC-250-Hackintosh-OpenCore](https://github.com/amethyst
 - **GPU recovery.** Apple's reset path is Navi 10's and hangs this GPU, so it's blocked. If the GPU hangs, the screen
   freezes until you reboot. It hasn't happened since the VRAM fixes, but there's no way back from it.
 - **Shutdown/restart.** WindowServer panics on the way down (`display_mode_did_change ... returns false`). It doesn't
-  affect the next boot. Not fixed yet.
+  affect the next boot. Not fixed yet. MetalCyan now retries the failing display-mode change once at shutdown (the only failure path is Apple's scanout VRAM allocation), untested; `debug.bc250.log` shows whether the retry helped.
 - **Sleep.** Not tested.
 
 ## Requirements
