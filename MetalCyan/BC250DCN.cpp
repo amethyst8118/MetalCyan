@@ -24,7 +24,8 @@ namespace
     constexpr UInt32 DENTIST_DPPCLK_WDIVIDER_SHIFT       = 24;
     constexpr UInt32 DENTIST_DISPCLK_CHG_DONE            = 1U << 19;
     constexpr UInt32 DENTIST_DPPCLK_CHG_DONE             = 1U << 20;
-    constexpr UInt32 DENTIST_DID_MIN                     = 0x0A;    // Divider 2.5, what the GOP runs at.
+    constexpr UInt32 DENTIST_DID_GOP                     = 0x0A;    // Divider 2.5, what the GOP runs at.
+    constexpr UInt32 DENTIST_DID_MIN_ABS                 = 0x08;    // Divider 2.0, start of DENTIST range 1.
     constexpr UInt32 DENTIST_DID_MAX                     = 0x7E;    // 0x7F is special (bypass); left alone.
     // CLK4 (clk_11_0_1_offset.h, CLK base 0x16C00): the DENTIST VCO, as dcn201_clk_mgr reads it.
     constexpr UInt32 CLK4_CLK_PLL_REQ                    = 0x16C00 + 0x460E;
@@ -122,6 +123,24 @@ void BC250DCN::processKext(KernelPatcher& patcher, size_t id, mach_vm_address_t 
             pllReq);
         this->vcoKHz = 2670000;
     }
+    // Opt-in display clock ceiling for high pixel-clock modes such as 4K 120 Hz: the smallest DID in
+    // [0x08, 0x0A] whose clock fits under the requested MHz. VCO 2670000 + bc250dispmhz=1200 gives 0x09
+    // (1186666 kHz); VCO 3000000 already reaches 1200 MHz at 0x0A, so the arg changes nothing. 1200 MHz is
+    // Linux's dcn201 max dispclk/dppclk (dcn201_clk_mgr.c max_supported_dispclk_khz).
+    UInt32 dispMHz = 0;
+    if (PE_parse_boot_argn("bc250dispmhz", &dispMHz, sizeof(dispMHz)) && dispMHz != 0) {
+        if (dispMHz < 1000 || dispMHz > 1200) {
+            BCLOG("BC250DCN", "Ignoring bc250dispmhz=%u (valid range 1000-1200)", dispMHz);
+        } else {
+            for (UInt32 d = DENTIST_DID_MIN_ABS; d <= DENTIST_DID_GOP; d++) {
+                if (this->didToKHz(d) <= dispMHz * 1000) { this->didMin = d; break; }
+            }
+            BCLOG("BC250DCN", "bc250dispmhz=%u: minimum DID 0x%X (%u kHz)", dispMHz, this->didMin,
+                this->didToKHz(this->didMin));
+        }
+    }
+    BCLOG("BC250DCN", "DENTIST VCO %u kHz (CLK4_CLK_PLL_REQ 0x%X); DISPCLK/DPPCLK ceiling %u kHz", this->vcoKHz,
+        pllReq, this->didToKHz(this->didMin));
     this->startClockWatcher();
 }
 
@@ -213,16 +232,24 @@ int BC250DCN::wrapApplyPipeSplitFlags(void* dc, void* context, int vlevel, int* 
 
 // -- 2. DENTIST clocks --
 
-// The DAL wanted appleVco / div; give it at least that from the real VCO, never above the GOP's 0x0A.
+// The DAL wanted appleVco / div; give it at least that from the real VCO, capped at didMin (the GOP's 0x0A by
+// default, lowered by bc250dispmhz=N).
 UInt32 BC250DCN::rescaleDid(UInt32 did) const
 {
     if (did < 8 || did > DENTIST_DID_MAX) { return did; }
     const auto div4   = didToDiv4(did);
     const auto target = static_cast<UInt32>(static_cast<UInt64>(div4) * this->vcoKHz / this->appleVcoKHz);
     auto       newDid = div4ToDid(target);
-    if (newDid < DENTIST_DID_MIN) { newDid = DENTIST_DID_MIN; }
+    if (newDid < this->didMin) { newDid = this->didMin; }
     if (newDid > DENTIST_DID_MAX) { newDid = DENTIST_DID_MAX; }
     return newDid;
+}
+
+// Real-VCO clock of a DID in kHz (VCO * 4 / div4); 0 outside the DENTIST range.
+UInt32 BC250DCN::didToKHz(UInt32 did) const
+{
+    if (did < 8 || did > DENTIST_DID_MAX) { return 0; }
+    return static_cast<UInt32>(static_cast<UInt64>(this->vcoKHz) * 4 / didToDiv4(did));
 }
 
 void BC250DCN::clockTick()
@@ -238,7 +265,7 @@ void BC250DCN::clockTick()
     const auto newDisp = disp != this->lastDispDid ? this->rescaleDid(disp) : disp;
     auto       newDpp  = dpp != this->lastDppDid ? this->rescaleDid(dpp) : dpp;
     // Without MPC splits one pipe carries the whole stream: keep DPPCLK at least DISPCLK (a lower DID is faster).
-    if (newDpp > newDisp && newDisp >= DENTIST_DID_MIN && newDpp <= DENTIST_DID_MAX) { newDpp = newDisp; }
+    if (newDpp > newDisp && newDisp >= this->didMin && newDpp <= DENTIST_DID_MAX) { newDpp = newDisp; }
     if (newDisp != disp) {
         nred.writeReg32(DENTIST_DISPCLK_CNTL, (nred.readReg32(DENTIST_DISPCLK_CNTL) & ~DENTIST_DISPCLK_WDIVIDER_MASK) |
                                                   newDisp);
@@ -257,6 +284,8 @@ void BC250DCN::clockTick()
     this->lastDispDid = newDisp;
     this->lastDppDid  = newDpp;
     if (newDisp != disp || newDpp != dpp) {
+        BCLOG("BC250DCN", "Display clocks DAL disp 0x%X dpp 0x%X -> disp 0x%X (%u kHz) dpp 0x%X (%u kHz)", disp,
+            dpp, newDisp, this->didToKHz(newDisp), newDpp, this->didToKHz(newDpp));
     }
 }
 

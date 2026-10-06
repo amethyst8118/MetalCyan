@@ -11,7 +11,9 @@
 //  1. DCN 2.0.1 has no DCN_VM aperture, so HUBP needs the carve-out's system (UMA) address, not its MC address
 //     (Linux: dcn201_hwseq.c gpu_addr_to_uma). Fixed where Apple hands planes and cursors to the DAL.
 //  2. The DAL sizes DENTIST dividers for Navi 10's VCO (~3.6 GHz); the BC-250's is read from CLK4_CLK_PLL_REQ
-//     (Linux: dcn201_clk_mgr.c). A watcher thread rescales the dividers whenever the DAL changes them.
+//     (Linux: dcn201_clk_mgr.c). A watcher thread rescales the dividers whenever the DAL changes them; the
+//     bc250dispmhz boot-arg raises the DISPCLK/DPPCLK ceiling for high pixel-clock modes, and the VCO and each
+//     rescale are logged.
 //  3. DCN 2.0.1 has 4 pipes, Navi 10 has 6: an MPC split lands on pipe 5 and half the screen is lost. The DAL's
 //     dcn20_validate_apply_pipe_split_flags, found by its __PRETTY_FUNCTION__ string, has its split requests
 //     withdrawn (one pipe per stream); DPPCLK is kept at least DISPCLK to carry it.
@@ -24,6 +26,7 @@ public:
 
 private:
     UInt32            vcoKHz{0};
+    UInt32            didMin{0x0A};    // Effective minimum DID: the GOP's 0x0A, lowered by bc250dispmhz=N.
     UInt64            fbBase{0}, fbTop{0}, fbOffset{0};
     UInt32            appleVcoKHz{3600000};
     UInt32            lastDispDid{0}, lastDppDid{0};
@@ -39,6 +42,7 @@ private:
     void   startClockWatcher();
     void   clockTick();
     UInt32 rescaleDid(UInt32 did) const;
+    UInt32 didToKHz(UInt32 did) const;
 
     static UInt64 wrapPrepareSurface(void* self, const void* displayPath, void* plane);
     static UInt64 wrapUpdateSurfaceInfo(void* self, const void* plane, const void* displayPath);

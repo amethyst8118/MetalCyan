@@ -22,8 +22,9 @@ For a complete EFI, see [BC-250-Hackintosh-OpenCore](https://github.com/amethyst
 
 ## What doesn't
 
-- **Hardware video decode/encode.** VCN can't be used on this chip, so macOS decodes in software. 4K video plays fine
-  in Firefox.
+- **Hardware video decode/encode.** VCN can't be used on this chip: AMD says VCN was never part of the BC-250's
+  product definition, the SMU firmware has no way to power it up and there's no signed VCN firmware, so Linux
+  doesn't use it either. macOS decodes in software. 4K video plays fine in Firefox.
 - **HDMI/DP audio.** The GPU's audio function isn't set up yet. Safari and the TV app refuse to play video without an
   audio output device; a virtual one (BlackHole etc.) gets around it.
 - **GPU recovery.** Apple's reset path is Navi 10's and hangs this GPU, so it's blocked. If the GPU hangs, the screen
@@ -62,14 +63,39 @@ in boot-args as well.
 | `bc250gputemp=N` | GPU temperature at which the forced GPU clock is released, 50-100 °C (default 90). |
 | `bc250cores=8` | Ask the SMU for all 8 cores; they'd show up after a Restart. Untested; use the OpenCore driver in the EFI repo instead. |
 | `bc250smu=0` | No SMU access at all (no telemetry, no tuning). |
+| `bc250dispmhz=N` | Display clock ceiling, 1000-1200 MHz (stock: the GOP's VCO/2.5). For 4K at 120 Hz. 1200 is Linux's limit for DCN 2.0.1. |
 
 Clocks and voltages are applied 60 seconds after boot, so a bad setting can't stop the machine from booting: you can
 always get to the desktop and take it out again. If the SMU stops responding (telemetry frozen, CPU stuck at one
 clock), remove the setting and power off for 10 seconds. A restart isn't enough.
 
+## 4K at 120 Hz
+
+Untested. Without compression, the BC-250's one DisplayPort 1.4 output carries 4K at 120 Hz only at 8-bit colour
+with a reduced-blanking (CVT-RB2) timing, about 1076 MHz pixel clock; CTA timings (1188 MHz) and 10-bit don't fit
+the link. MetalCyan keeps each display on one pipe, so the display clock has to carry the whole pixel rate: check
+`sysctl -n debug.bc250.log` for the `DENTIST VCO` line, and if the ceiling is below ~1080 MHz add
+`bc250dispmhz=1200`. The monitor's EDID must offer a 4K 120 Hz reduced-blanking mode, otherwise macOS won't list
+it and an EDID override is needed. Use a certified DP 1.4 (HBR3) cable. If the screen goes black, remove the arg
+(or boot with -MCOff). Unlike the SMU settings above, `bc250dispmhz` takes effect at boot, so a bad value is
+reverted by removing the arg in the OpenCore picker or config.
+
+DSC: Linux's DCN 2.0.1 driver claims no DSC engines, but the chip has two at Navi 10's DSC0/DSC1 addresses. The
+[linux-cachyos-bc250](https://github.com/MastaG/linux-cachyos-bc250) `0010-dcn201-enable-dsc` patch turns them on
+and runs 4K 120 Hz RGB with DSC into a DP to HDMI 2.1 adapter. Apple's Navi 10 display code (26.7.1) always creates
+six DSC engines at Navi 10's addresses, so DSC0/DSC1 land on the real ones; whether it uses them on the BC-250 is
+untested.
+
+DP to HDMI 2.1 adapters: the picture still crosses the BC-250's DP 1.4 link, and HDMI TVs expect the CTA timing
+(1188 MHz). That needs DSC (the adapter must advertise it; the Cable Matters 102101 / VMM7100 on firmware 7.02.120
+reports none, and its firmware updater runs on any Windows PC with the adapter plugged in) or YCbCr 4:2:0. Either way
+the display clock at 1188 MHz needs a VCO of about 3.0 GHz (at 2.67 GHz the steps are 1068 and 1187 MHz). Apple's
+display code has the YCbCr 4:2:0 and DP to HDMI 2.1 (FRL) adapter paths; untested on the BC-250.
+
 ## Logs
 
 - `sysctl -n debug.bc250.log`: MetalCyan's own log since boot. Only errors and warnings, plus the SMU tuning lines.
+  The DENTIST VCO and clock ceiling and each display-clock change are logged there too.
   On a normal boot you'll also see `createPspDirectory call not found` and `PSP: firmware load (handle 10) not done:
   2`. Both are harmless.
 - `sysctl -n debug.bc250.smu`: live SMU telemetry (GPU clock and voltage, CPU voltage, Tctl, per-core clocks).
