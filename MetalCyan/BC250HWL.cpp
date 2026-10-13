@@ -13,6 +13,7 @@
 #include <IOKit/IOWorkLoop.h>
 #include <libkern/c++/OSCollectionIterator.h>
 #include <kern/thread.h>
+#include <kern/thread_call.h>
 #include <GPUDriversAMD/CAIL/ASICCaps.hpp>
 #include <GPUDriversAMD/CAIL/DeviceType.hpp>
 #include <GPUDriversAMD/Family.hpp>
@@ -131,10 +132,35 @@ namespace
     // submitted-but-unseen work every 10 ms, every 1 ms while there is. It runs on a workloop of its own: on the
     // framebuffer's, it could not fire while the display bring-up waited on SDMA1 holding that workloop's gate (a
     // 12 s stall at boot); IRQMgr itself dispatches from several threads.
+    // Bug 5: that still saw a finished job on SDMA1's page queue 0.5-8 ms late, and every page-table update goes there
+    // (each new buffer, IOSurface or mapping; the GFX work using it waits for it): a new 8 MiB buffer's first blit
+    // started 2.7 ms (median) after commit instead of 0.25 ms, a shared one 7.6 ms (now 0.4 ms and 4.1 ms; the shared
+    // one's kernel paging work and ten page-table jobs take most of that). Each submission to an SDMA1 channel
+    // (AMDHWChannel::submitCommandBuffer; AMDDMAHWChannel's calls it through the base vtable) now schedules a
+    // poll 50 us out, repeated every 100 us while SDMA1 has unseen work, until 2 ms pass without any of it completing
+    // (a burst of page-table jobs keeps it going; one stuck job falls back to the timer's 1 ms). The poll is a thread
+    // call of its own: arming the timer from the submitting threads raced its own re-arm (IOTimerEventSource::wakeAtTime
+    // increments calloutGeneration unlocked, which can leave the pending callout with a stale generation whose action
+    // never runs), and in some boots the timer stopped firing for good.
+    constexpr UInt32    kSdma1SubmitDelayUs = 50, kSdma1FastPollUs = 100, kSdma1FastPolls = 20;
     mach_vm_address_t   sdma1NotifyOrg = 0;
     volatile UInt32     sdma1KickBusy  = 0;
     IOTimerEventSource* sdma1Timer     = nullptr;
     IOWorkLoop*         sdma1WorkLoop  = nullptr;
+    thread_call_t       sdma1FastCall  = nullptr;
+    volatile UInt32     sdma1FastArmed = 0;    // A poll is scheduled, or about to be.
+    UInt32              sdma1FastPolls = 0;    // Polls without progress; this and sdma1LastSeen are the thread call's.
+    UInt32              sdma1LastSeen  = 0;    // Sum of the SDMA1 channels' last-seen stamps at the last poll.
+
+    bool sdma1IsChannel(void* channel)
+    {
+        for (UInt32 r = 0; r < irqRegCount; r++) {
+            if (irqRegs[r].type != 0xFF0003E8 && irqRegs[r].type != 0xFF0003E9) { continue; }
+            void* callback = irqRegs[r].callback;
+            if (callback != nullptr && getMember<void*>(callback, 0x20) == channel) { return true; }
+        }
+        return false;
+    }
 
     bool sdma1Pending()
     {
@@ -147,6 +173,18 @@ namespace
             }
         }
         return false;
+    }
+
+    UInt32 sdma1Seen()
+    {
+        UInt32 seen = 0;
+        for (UInt32 r = 0; r < irqRegCount; r++) {
+            if (irqRegs[r].type != 0xFF0003E8 && irqRegs[r].type != 0xFF0003E9) { continue; }
+            void* callback = irqRegs[r].callback;
+            void* channel  = callback ? getMember<void*>(callback, 0x20) : nullptr;
+            if (channel != nullptr) { seen += getMember<UInt32>(channel, 0x84); }
+        }
+        return seen;
     }
 
     void sdma1Kick(mach_vm_address_t org, void* current, void* info)
@@ -169,11 +207,48 @@ namespace
         sdma1KickBusy = 0;
     }
 
+    void sdma1FastArm(UInt32 us)
+    {
+        UInt64 deadline = 0;
+        clock_interval_to_deadline(us, kMicrosecondScale, &deadline);
+        thread_call_enter_delayed(sdma1FastCall, deadline);
+    }
+
+    // THREAD_CALL_OPTIONS_ONCE: never runs concurrently with itself.
+    void sdma1FastFired(thread_call_param_t, thread_call_param_t)
+    {
+        // A locked clear: a plain store could be passed by the pending check below (x86 store-load reordering), and a
+        // submission still seeing the flag set would not arm while this poll missed its work.
+        OSBitAndAtomic(0, &sdma1FastArmed);
+        if (sdma1Pending()) { sdma1Kick(0, nullptr, nullptr); }
+        const UInt32 seen = sdma1Seen();
+        if (seen != sdma1LastSeen) {
+            sdma1LastSeen  = seen;
+            sdma1FastPolls = 0;
+        }
+        if (sdma1Pending() && sdma1FastPolls < kSdma1FastPolls && OSCompareAndSwap(0, 1, &sdma1FastArmed)) {
+            sdma1FastPolls += 1;
+            sdma1FastArm(kSdma1FastPollUs);
+        }
+    }
+
     void sdma1TimerFired(OSObject*, IOTimerEventSource* timer)
     {
         const bool pending = sdma1Pending();
         if (pending) { sdma1Kick(0, nullptr, nullptr); }
         timer->setTimeoutUS(pending ? 1000 : 10000);
+    }
+
+    mach_vm_address_t orgHwChannelSubmit = 0;
+
+    UInt64 wrapHwChannelSubmit(void* channel, void* info)
+    {
+        const UInt64 ret = FunctionCast(wrapHwChannelSubmit, orgHwChannelSubmit)(channel, info);
+        // One poll scheduled at a time: rescheduling on every submission would keep pushing it back under a stream.
+        if (sdma1FastCall != nullptr && sdma1IsChannel(channel) && OSCompareAndSwap(0, 1, &sdma1FastArmed)) {
+            sdma1FastArm(kSdma1SubmitDelayUs);
+        }
+        return ret;
     }
 
     mach_vm_address_t orgStartInterrupts = 0;
@@ -194,6 +269,11 @@ namespace
                 OSSafeReleaseNULL(sdma1Timer);
                 OSSafeReleaseNULL(sdma1WorkLoop);
             }
+            if (sdma1FastCall == nullptr) {
+                sdma1FastCall = thread_call_allocate_with_options(sdma1FastFired, nullptr,
+                    THREAD_CALL_PRIORITY_KERNEL_HIGH, THREAD_CALL_OPTIONS_ONCE);
+            }
+            if (sdma1FastCall == nullptr) { BCLOG("BC250HWL", "SDMA1 submission poll not allocated"); }
         }
         return ret;
     }
@@ -2990,6 +3070,15 @@ void BC250HWL::processKext(KernelPatcher& patcher, size_t id, mach_vm_address_t 
         hookVmEntries(patcher, id, slide, size);
         hookHwInfo(patcher, id, slide, size);
         hookHubInvalidateRequests(patcher, id, slide, size);
+    }
+    if (kext == Kext::Accel) {
+        KernelPatcher::RouteRequest submit {
+            "__ZN27AMDRadeonX6000_AMDHWChannel19submitCommandBufferEP30AMD_SUBMIT_COMMAND_BUFFER_INFO",
+            wrapHwChannelSubmit, orgHwChannelSubmit};
+        if (!patcher.routeMultiple(id, &submit, 1, slide, size) || orgHwChannelSubmit == 0) {
+            BCLOG("BC250HWL", "AMDHWChannel::submitCommandBuffer not hooked; no SDMA1 poll after submissions");
+            patcher.clearError();
+        }
     }
     if (kext == Kext::FB) {
         KernelPatcher::RouteRequest start {"__ZN34AMDRadeonX6000_AmdInterruptManager15startInterruptsEP10IOWorkLoop",

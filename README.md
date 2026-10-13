@@ -102,7 +102,9 @@ starts. GVM, GC and SDMA are programmed the way Linux's amdgpu does it on Cyan S
 - **KIQ:** SET_RESOURCES is sent as Linux sends it.
 - **Compute:** compute work runs on the GFX ring. GFX1013's MEC doesn't execute dispatches reliably, and Linux
   doesn't use it either.
-- **SDMA1:** its trap enable and completion events are fixed up so its work doesn't sit unnoticed.
+- **SDMA1:** its trap enable and completion events are fixed up so its work doesn't sit unnoticed, and its completions
+  are polled right after each submission. SDMA1 runs every page-table update, so a new buffer or surface no longer
+  waits for the next display refresh before the GPU can use it.
 - **VRAM:** all 4 GB is made CPU-visible, and the reuse cache that leaked VRAM until the screen went green is off.
 - **Blocked:** Navi 10's reset and hang-dump paths, and VCN's properties, so macOS doesn't try a hardware decoder that
   isn't there.
