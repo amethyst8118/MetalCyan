@@ -58,6 +58,7 @@ in boot-args as well.
 | `bc250gfxmv=N` | GPU voltage, 700-1100 mV, used with `bc250gfxmhz`. At most 50 mV below the stock curve for that clock. |
 | `bc250cpumhz=N` | CPU boost clock, 3500-4500 MHz. Always comes with an undervolt worked out from `bc250cpuvmax`. |
 | `bc250cpuvmax=N` | CPU voltage ceiling, 950-1325 mV (default 1275). |
+| `bc250cpuminmhz=N` | CPU minimum clock, 1400 MHz up to the boost clock. The SMU idles the cores at 1400 MHz and takes 15-20 ms to raise the clock once work arrives, so short bursts (most UI work) run slowly; 3200 runs them at ~3.2 GHz for +175 mV at idle. Also `sudo sysctl debug.bc250.cpuminmhz=N` at run time (0 = 1400 MHz). |
 | `bc250cputemp=N` | CPU temperature limit, 50-100 °C (default 90 when `bc250cpumhz` is set). |
 | `bc250gputemp=N` | GPU temperature at which the forced GPU clock is released, 50-100 °C (default 90). |
 | `bc250cores=8` | Ask the SMU for all 8 cores; they'd show up after a Restart. Untested; use the OpenCore driver in the EFI repo instead. |

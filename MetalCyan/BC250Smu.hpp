@@ -17,6 +17,10 @@
 //                        scale (0x50, -50..0) is predicted with bc250_smu_oc's model for bc250cpuvmax and set once
 //                        (no run-time adjustment). As bc250_smu_oc: extra voltage off (0x9A 1) first.
 //  bc250cpuvmax=N        CPU voltage ceiling, 950-1325 mV (default 1275; never above 1.325 V).
+//  bc250cpuminmhz=N      CPU minimum clock, 1400 MHz up to the boost clock (queue 0 0x35 per core, as bc250_smu_oc's
+//                        set_soft_min_cclk). The firmware idles the cores at 1400 MHz and takes ~20 ms to ramp back up
+//                        when work arrives; a higher minimum runs short bursts (most UI work) at full speed. Also
+//                        `sysctl debug.bc250.cpuminmhz=N` at run time (0 = the firmware's 1400 MHz floor).
 //  bc250cputemp=N        CPU temperature limit (0x8B), 50-100 C (default 90 with bc250cpumhz).
 //  bc250gputemp=N        GPU temperature limit (0x8C), 50-100 C.
 //  bc250gfxmhz=N         GPU clock, forced (queue 0 0x39), 350-2000 MHz; voltage from the governor's safe points
@@ -65,14 +69,19 @@ public:
 
     const Telemetry& telemetry() const { return this->last; }
 
+    // CPU soft minimum clock (0 = the firmware's floor). Returns the status of the last message sent.
+    UInt32 setCpuMinMHz(UInt32 mhz);
+    UInt32 cpuMinMHz() const { return this->tune.cpuMinApplied; }
+
     // Opt-in tuning from the boot-args (0 = not requested).
     struct Tune
     {
         UInt32 cores {0};
-        UInt32 cpuMHz {0}, cpuVmax {0}, cpuTempC {0}, gpuTempC {0};
+        UInt32 cpuMHz {0}, cpuMinMHz {0}, cpuVmax {0}, cpuTempC {0}, gpuTempC {0};
         UInt32 gfxMHz {0}, gfxMv {0};
         // Applied state.
-        bool   cpuActive {false}, cpuTried {false}, gfxActive {false}, gfxTried {false};
+        bool   cpuActive {false}, cpuTried {false}, cpuMinTried {false}, gfxActive {false}, gfxTried {false};
+        UInt32 cpuMinApplied {0};
         UInt32 cpuWaitPolls {0}, gfxWaitPolls {0};
         SInt32 cpuScale {0};
         UInt32 cpuAppliedMHz {0};

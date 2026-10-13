@@ -64,10 +64,13 @@ namespace
     // Tuning messages (queue << 8 | message); each argument is checked in sendTune.
     constexpr UInt32 kTuneCoreUnlock = 0x0398, kTuneCpuTemp = 0x038B, kTuneGpuTemp = 0x038C, kTuneExtraVolt = 0x039A,
                      kTuneVidScale = 0x0350, kTuneCpuBoost = 0x038F, kTuneGfxFreq = 0x0039, kTuneGfxUnforceFreq = 0x003A,
-                     kTuneGfxVid = 0x003B, kTuneGfxUnforceVid = 0x003C;
+                     kTuneGfxVid = 0x003B, kTuneGfxUnforceVid = 0x003C, kTuneCpuSoftMin = 0x0035;
     constexpr UInt32 kCoreUnlockSmn = 0x0005A870;    // What bc250-core-unlock reads and passes to 0x98 (never 0)
     constexpr UInt32 kCoreMaskStock = 0x77, kCoreMaskAll = 0xFF;
     constexpr UInt32 kCpuMinMHz = 3500, kCpuMaxMHz = 4500, kCpuVmin = 950, kCpuVmaxLimit = 1325, kCpuVmaxDefault = 1275;
+    // CPU soft minimum clock (Q0 0x35, argument core << 20 | MHz, as bc250_smu_oc's set_soft_min_cclk). 1400 MHz is the
+    // floor the firmware idles the cores at.
+    constexpr UInt32 kCpuFloorMHz = 1400;
     constexpr SInt32 kScaleMin = -50, kScaleMax = 0;
     constexpr UInt32 kTempMin = 50, kTempMax = 100, kCpuTempDefault = 90, kGpuGuardDefault = 90;
     // Hard limits. 2000 MHz is amdgpu's CYAN_SKILLFISH_SCLK_MAX; on the stock SMU firmware Q0 0x39 with 2230 MHz
@@ -119,11 +122,21 @@ namespace
     {
         return SYSCTL_OUT(req, smuText, smuTextLen + 1);
     }
+
+    int sysctlHandleCpuMin(struct sysctl_oid* oidp, void*, int, struct sysctl_req* req)
+    {
+        int        value = static_cast<int>(BC250Smu::singleton().cpuMinMHz());
+        const auto error = sysctl_handle_int(oidp, &value, 0, req);
+        if (error != 0 || req->newptr == USER_ADDR_NULL) { return error; }
+        return BC250Smu::singleton().setCpuMinMHz(value < 0 ? 0 : static_cast<UInt32>(value)) == BC250Smu::kOk ? 0 : EINVAL;
+    }
 }    // namespace
 
 SYSCTL_DECL(_debug_bc250);
 SYSCTL_PROC(_debug_bc250, OID_AUTO, smu, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, sysctlHandleSmu, "A",
     "BC-250 SMU telemetry");
+SYSCTL_PROC(_debug_bc250, OID_AUTO, cpuminmhz, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, 0, sysctlHandleCpuMin,
+    "I", "BC-250 CPU soft minimum clock (MHz)");
 
 void bc250SmuThread(void* self, int) { static_cast<BC250Smu*>(self)->run(); }
 
@@ -141,6 +154,7 @@ void BC250Smu::start()
     thread_deallocate(thread);
     this->started = true;
     sysctl_register_oid(&sysctl__debug_bc250_smu);
+    sysctl_register_oid(&sysctl__debug_bc250_cpuminmhz);
     BCLOG("BC250SMU", "telemetry thread started (bc250smu=0 disables)");
 }
 
@@ -224,6 +238,9 @@ UInt32 BC250Smu::sendTune(UInt32 queue, UInt32 msg, UInt32 arg)
             break;
         }
         case kTuneCpuBoost: ok = arg >= kCpuMinMHz && arg <= kCpuMaxMHz; break;
+        case kTuneCpuSoftMin: ok = (arg >> 20) < 8 && ((arg >> 16) & 0xF) == 0 && (arg & 0xFFFF) >= kCpuFloorMHz &&
+                                   (arg & 0xFFFF) <= kCpuMaxMHz;
+            break;
         case kTuneGfxFreq: ok = arg >= kGfxMinMHz && arg <= kGfxMaxMHz; break;
         case kTuneGfxVid: ok = arg >= milliVoltsToVid(kGfxMaxMv) && arg <= milliVoltsToVid(kGfxMinMv); break;
         case kTuneGfxUnforceFreq:
@@ -274,6 +291,11 @@ void BC250Smu::parseTune()
         BCLOG("BC250SMU", "tune: bc250cpumhz=%u ignored (%u-%u)", u.cpuMHz, kCpuMinMHz, kCpuMaxMHz);
         u.cpuMHz = 0;
     }
+    u.cpuMinMHz = bootArg("bc250cpuminmhz");
+    if (u.cpuMinMHz != 0 && (u.cpuMinMHz < kCpuFloorMHz || u.cpuMinMHz > kCpuMaxMHz)) {
+        BCLOG("BC250SMU", "tune: bc250cpuminmhz=%u ignored (%u-%u)", u.cpuMinMHz, kCpuFloorMHz, kCpuMaxMHz);
+        u.cpuMinMHz = 0;
+    }
     u.cpuVmax = bootArg("bc250cpuvmax");
     if (u.cpuVmax == 0) { u.cpuVmax = kCpuVmaxDefault; }
     u.cpuVmax = u.cpuVmax < kCpuVmin ? kCpuVmin : u.cpuVmax > kCpuVmaxLimit ? kCpuVmaxLimit : u.cpuVmax;
@@ -296,9 +318,10 @@ void BC250Smu::parseTune()
             gfxSafeMilliVolts(u.gfxMHz) - kGfxUndervoltMax);
         u.gfxMv = gfxSafeMilliVolts(u.gfxMHz) - kGfxUndervoltMax;
     }
-    if (u.cores || u.cpuMHz || u.cpuTempC || u.gpuTempC || u.gfxMHz) {
-        BCLOG("BC250SMU", "tune: cores %u, CPU %u MHz (<= %u mV, %u C), GPU temp %u C, GFX %u MHz @ %u mV", u.cores,
-            u.cpuMHz, u.cpuVmax, u.cpuTempC, u.gpuTempC, u.gfxMHz, u.gfxMHz ? (u.gfxMv ? u.gfxMv : gfxSafeMilliVolts(u.gfxMHz)) : 0);
+    if (u.cores || u.cpuMHz || u.cpuMinMHz || u.cpuTempC || u.gpuTempC || u.gfxMHz) {
+        BCLOG("BC250SMU", "tune: cores %u, CPU %u MHz (min %u MHz, <= %u mV, %u C), GPU temp %u C, GFX %u MHz @ %u mV",
+            u.cores, u.cpuMHz, u.cpuMinMHz, u.cpuVmax, u.cpuTempC, u.gpuTempC, u.gfxMHz,
+            u.gfxMHz ? (u.gfxMv ? u.gfxMv : gfxSafeMilliVolts(u.gfxMHz)) : 0);
     }
 }
 
@@ -365,6 +388,20 @@ void BC250Smu::applyCpuTune(const Telemetry& t)
     }
 }
 
+UInt32 BC250Smu::setCpuMinMHz(UInt32 mhz)
+{
+    // 0 restores the firmware's floor.
+    const UInt32 target = mhz == 0 ? kCpuFloorMHz : mhz;
+    const UInt32 mask   = this->last.coreMask;
+    if (mask == 0 || target < kCpuFloorMHz || target > kCpuMaxMHz) { return kFailed; }
+    UInt32 status = kOk;
+    for (UInt32 core = 0; core < 8 && status == kOk; core++) {
+        if ((mask >> core) & 1) { status = this->sendTune(0, 0x35, (core << 20) | target); }
+    }
+    if (status == kOk) { this->tune.cpuMinApplied = mhz; }
+    return status;
+}
+
 void BC250Smu::applyGfxTune(const Telemetry& t)
 {
     auto& u = this->tune;
@@ -397,6 +434,11 @@ void BC250Smu::guardTune(const Telemetry& t)
     if (u.cpuMHz != 0 && !u.cpuTried && ++u.cpuWaitPolls >= 60) {
         BCLOG("BC250SMU", "tune: applying CPU %u MHz now", u.cpuMHz);
         this->applyCpuTune(t);
+    }
+    // The minimum after the boost clock (it is clamped to the boost), or after the same ~60 s without one.
+    if (u.cpuMinMHz != 0 && !u.cpuMinTried && (u.cpuMHz != 0 ? u.cpuTried : ++u.cpuWaitPolls >= 60)) {
+        u.cpuMinTried = true;
+        BCLOG("BC250SMU", "tune: CPU minimum %u MHz -> status 0x%02X", u.cpuMinMHz, this->setCpuMinMHz(u.cpuMinMHz));
     }
     if (u.gfxMHz != 0 && !u.gfxTried && ++u.gfxWaitPolls >= 60 && t.gpuBusyValid) {
         BCLOG("BC250SMU", "tune: applying GFX %u MHz now (GPU busy %u%%)", u.gfxMHz, t.gpuBusyPercent);
