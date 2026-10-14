@@ -70,6 +70,11 @@ namespace
     constexpr UInt32 kCpuMinMHz = 3500, kCpuMaxMHz = 4500, kCpuVmin = 950, kCpuVmaxLimit = 1325, kCpuVmaxDefault = 1275;
     constexpr SInt32 kScaleMin = -50, kScaleMax = 0;
     constexpr UInt32 kTempMin = 50, kTempMax = 100, kCpuTempDefault = 90, kGpuGuardDefault = 90;
+    // The guard reads Tctl, which on this shared die is the CPU's control temperature, so an all-core CPU load
+    // releases the GFX tune even with the GPU idle. Re-apply once the die has been this far under the guard for
+    // this many polls (~1 s each): the margin and the dwell keep a die sitting at the limit from flapping the SMU.
+    constexpr SInt32 kGpuGuardHysteresisDeciC = 50;
+    constexpr UInt32 kGpuReapplyPolls = 10, kGpuMaxReapplyFails = 5;
     // Hard limits. 2000 MHz is amdgpu's CYAN_SKILLFISH_SCLK_MAX; on the stock SMU firmware Q0 0x39 with 2230 MHz
     // never answered and the SMU stopped responding on every queue (CPU clocks froze) until a power cycle.
     // 1100 mV stays under amdgpu's 1129 mV CYAN_SKILLFISH_VDDC_MAX.
@@ -402,14 +407,29 @@ void BC250Smu::guardTune(const Telemetry& t)
         BCLOG("BC250SMU", "tune: applying GFX %u MHz now (GPU busy %u%%)", u.gfxMHz, t.gpuBusyPercent);
         this->applyGfxTune(t);
     }
-    // GPU: back to firmware control if the die gets too hot.
+    // GPU: back to firmware control if the die gets too hot, and back to the tune once it cools.
     const SInt32 gpuGuard = static_cast<SInt32>(u.gpuTempC ? u.gpuTempC : kGpuGuardDefault) * 10;
     if (u.gfxActive && t.tctlDeciC >= gpuGuard) {
         this->sendTune(0, 0x3A, 0);
         this->sendTune(0, 0x3C, 0);
-        u.gfxActive = false;
+        u.gfxActive   = false;
+        u.gfxReleased = true;
+        u.gfxCoolPolls = 0;
         BCLOG("BC250SMU", "tune guard: Tctl %d.%d C >= %d C, GFX clock/voltage released to the firmware", t.tctlDeciC / 10,
             t.tctlDeciC % 10, gpuGuard / 10);
+    }
+    else if (u.gfxReleased && !u.gfxActive && u.gfxReapplyFails < kGpuMaxReapplyFails) {
+        if (t.tctlDeciC > gpuGuard - kGpuGuardHysteresisDeciC) { u.gfxCoolPolls = 0; }
+        else if (++u.gfxCoolPolls >= kGpuReapplyPolls) {
+            u.gfxCoolPolls = 0;
+            BCLOG("BC250SMU", "tune guard: Tctl %d.%d C under %d C for %u polls, re-applying GFX", t.tctlDeciC / 10,
+                t.tctlDeciC % 10, (gpuGuard - kGpuGuardHysteresisDeciC) / 10, kGpuReapplyPolls);
+            this->applyGfxTune(t);
+            if (!u.gfxActive && ++u.gfxReapplyFails >= kGpuMaxReapplyFails) {
+                BCLOG("BC250SMU", "tune guard: GFX re-apply failed %u times, leaving the GPU to the firmware",
+                    u.gfxReapplyFails);
+            }
+        }
     }
 }
 

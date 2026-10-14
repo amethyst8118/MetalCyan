@@ -73,7 +73,9 @@ public:
         UInt32 gfxMHz {0}, gfxMv {0};
         // Applied state.
         bool   cpuActive {false}, cpuTried {false}, gfxActive {false}, gfxTried {false};
-        UInt32 cpuWaitPolls {0}, gfxWaitPolls {0};
+        // Set when the temperature guard released the GFX tune, so the poll can re-apply it once the die cools.
+        bool   gfxReleased {false};
+        UInt32 cpuWaitPolls {0}, gfxWaitPolls {0}, gfxCoolPolls {0}, gfxReapplyFails {0};
         SInt32 cpuScale {0};
         UInt32 cpuAppliedMHz {0};
     };
