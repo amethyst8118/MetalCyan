@@ -6,6 +6,7 @@
 #include <AGDP.hpp>
 #include <BC250.hpp>
 #include <BC250HWL.hpp>
+#include <BC250Kpti.hpp>
 #include <DriverInjector.hpp>
 #include <GPUDriversAMD/ATOMBIOS.hpp>
 #include <GPUDriversAMD/CAIL/Result.hpp>
@@ -50,6 +51,7 @@ void NRed::init()
         [](void* const, KernelPatcher& patcher)
         {
             singleton().processPatcher();
+            BC250Kpti::singleton().processPatcher(patcher);
             DriverInjector::singleton().processPatcher(patcher);
             PenguinWizardry::RuntimeMCManager::singleton().processPatcher(patcher);
         },
