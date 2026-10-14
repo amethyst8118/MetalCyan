@@ -37,9 +37,25 @@ namespace
         "int dcn20_validate_apply_pipe_split_flags(struct dc *, struct dc_state *, int, int *, _Bool *)";
     constexpr size_t MAX_PIPES = 6;    // Navi 10's DAL, the size of the split[] arrays it passes around.
 
+    // dcn20_update_clocks_update_dentist's __func__, which its REG_WAITs pass. It opens with the guard
+    // `if (!clks.dppclk_khz || !clks.dispclk_khz) return;` (mov/test/je on clk_mgr_internal +0x18, then +0x10),
+    // which wrapUpdateDentist repeats, so the routed function has to start with exactly that.
+    const char       kUpdateDentist[]    = "dcn20_update_clocks_update_dentist";
+    const UInt8      kDentistGuardDpp[]  = {0x8B, 0x4F, 0x18, 0x85, 0xC9, 0x0F, 0x84};
+    const UInt8      kDentistGuardDisp[] = {0x8B, 0x7F, 0x10, 0x85, 0xFF, 0x0F, 0x84};
+    constexpr size_t DENTIST_GUARD_SCAN  = 0x40;
+    constexpr size_t CLKS_DISPCLK_KHZ    = 0x10;
+    constexpr size_t CLKS_DPPCLK_KHZ     = 0x18;
+
     // DENTIST divider IDs in quarter steps (dcn20_clk_mgr.c ranges 1 and 2; the 7-bit field never reaches 3).
     UInt32 didToDiv4(UInt32 did) { return did < 64 ? did : 64 + (did - 64) * 2; }
     UInt32 div4ToDid(UInt32 div4) { return div4 < 64 ? div4 : 64 + (div4 - 64) / 2; }
+    // The clock a DID gives off `vcoKHz` (DID in quarter steps), in MHz; 0 for a DID with no divider.
+    UInt32 didToMHz(UInt32 vcoKHz, UInt32 did)
+    {
+        const auto div4 = didToDiv4(did);
+        return div4 == 0 ? 0 : vcoKHz * 4 / div4 / 1000;
+    }
 
     // Finds the function that references `str` with a RIP-relative LEA, by walking back to its prologue. Every
     // reference has to resolve to the same function, otherwise nothing is returned.
@@ -121,6 +137,29 @@ void BC250DCN::processKext(KernelPatcher& patcher, size_t id, mach_vm_address_t 
         BCLOG("BC250DCN", "Implausible DENTIST VCO %u kHz (CLK4_CLK_PLL_REQ 0x%X); using 2670000", this->vcoKHz,
             pllReq);
         this->vcoKHz = 2670000;
+    }
+    BCLOG("BC250DCN", "DENTIST VCO %u kHz (CLK4_CLK_PLL_REQ 0x%X), DAL assumes %u kHz", this->vcoKHz, pllReq,
+        this->appleVcoKHz);
+    this->clockLock = IOLockAlloc();
+    if (this->clockLock == nullptr) {
+        BCLOG("BC250DCN", "Failed to allocate the DENTIST lock; dividers left as the DAL sets them");
+        return;
+    }
+    // Catches every DAL divider write, also one equal to what is programmed, which the watcher cannot see.
+    {
+        const auto fn      = findFunctionByString(slide, size, kUpdateDentist, sizeof(kUpdateDentist));
+        size_t     off     = 0;
+        const auto guarded = fn != 0 &&
+                             KernelPatcher::findPattern(kDentistGuardDpp, nullptr, sizeof(kDentistGuardDpp),
+                                 reinterpret_cast<const void*>(fn), DENTIST_GUARD_SCAN, &off) &&
+                             KernelPatcher::findPattern(kDentistGuardDisp, nullptr, sizeof(kDentistGuardDisp),
+                                 reinterpret_cast<const void*>(fn), DENTIST_GUARD_SCAN, &off);
+        KernelPatcher::RouteRequest request {nullptr, wrapUpdateDentist, this->orgUpdateDentist};
+        request.from = fn;
+        if (!guarded || !patcher.routeMultiple(id, &request, 1)) {
+            BCLOG("BC250DCN", "dcn20_update_clocks_update_dentist not routed; a DAL divider equal to ours goes unseen");
+            patcher.clearError();
+        }
     }
     this->startClockWatcher();
 }
@@ -225,18 +264,13 @@ UInt32 BC250DCN::rescaleDid(UInt32 did) const
     return newDid;
 }
 
-void BC250DCN::clockTick()
+// Programs the rescaled dividers. `disp`/`dpp` are the fields as read back; a field `FromDal` holds what the DAL
+// just wrote and is rescaled, any other one holds our last value and is kept. The caller holds clockLock.
+void BC250DCN::applyDids(UInt32 disp, UInt32 dpp, bool dispFromDal, bool dppFromDal)
 {
-    auto&      nred = NRed::singleton();
-    const auto v    = nred.readReg32(DENTIST_DISPCLK_CNTL);
-    const auto disp = v & DENTIST_DISPCLK_WDIVIDER_MASK;
-    const auto dpp  = (v >> DENTIST_DPPCLK_WDIVIDER_SHIFT) & DENTIST_DISPCLK_WDIVIDER_MASK;
-    if (disp == this->lastDispDid && dpp == this->lastDppDid) { return; }
-
-    // Only a field the DAL changed is rescaled; one still holding our last value is already corrected (the DAL
-    // writes DISPCLK and DPPCLK separately, so a tick can land between the two).
-    const auto newDisp = disp != this->lastDispDid ? this->rescaleDid(disp) : disp;
-    auto       newDpp  = dpp != this->lastDppDid ? this->rescaleDid(dpp) : dpp;
+    auto&      nred    = NRed::singleton();
+    const auto newDisp = dispFromDal ? this->rescaleDid(disp) : disp;
+    auto       newDpp  = dppFromDal ? this->rescaleDid(dpp) : dpp;
     // Without MPC splits one pipe carries the whole stream: keep DPPCLK at least DISPCLK (a lower DID is faster).
     if (newDpp > newDisp && newDisp >= DENTIST_DID_MIN && newDpp <= DENTIST_DID_MAX) { newDpp = newDisp; }
     if (newDisp != disp) {
@@ -254,10 +288,54 @@ void BC250DCN::clockTick()
             IODelay(10);
         }
     }
+    // Logged only when the DAL's request or the programmed divider moved, not when the DAL repeats itself.
+    if ((dispFromDal && disp != this->dalDispDid) || newDisp != this->lastDispDid) {
+        BCLOG("BC250DCN", "DENTIST DISPCLK DID 0x%X (was 0x%X) -> 0x%X: DAL %u MHz -> actual %u MHz", disp,
+            this->lastDispDid, newDisp, didToMHz(this->appleVcoKHz, disp), didToMHz(this->vcoKHz, newDisp));
+    }
+    if ((dppFromDal && dpp != this->dalDppDid) || newDpp != this->lastDppDid) {
+        BCLOG("BC250DCN", "DENTIST DPPCLK DID 0x%X (was 0x%X) -> 0x%X: DAL %u MHz -> actual %u MHz", dpp,
+            this->lastDppDid, newDpp, didToMHz(this->appleVcoKHz, dpp), didToMHz(this->vcoKHz, newDpp));
+    }
+    if (dispFromDal) { this->dalDispDid = disp; }
+    if (dppFromDal) { this->dalDppDid = dpp; }
     this->lastDispDid = newDisp;
     this->lastDppDid  = newDpp;
-    if (newDisp != disp || newDpp != dpp) {
+}
+
+// The DAL writes both dividers here, also a value equal to what is programmed (e.g. 0x11 for 144 Hz after 120 Hz's
+// 0x15 was corrected to 0x11), which leaves the register unchanged; so both are rescaled from what it left. The lock
+// keeps the watcher out between its DISPCLK and DPPCLK writes.
+void BC250DCN::wrapUpdateDentist(void* clkMgr, void* context)
+{
+    auto& s = singleton();
+    IOLockLock(s.clockLock);
+    FunctionCast(wrapUpdateDentist, s.orgUpdateDentist)(clkMgr, context);
+    SInt32 dispKHz, dppKHz;
+    memcpy(&dispKHz, static_cast<const UInt8*>(clkMgr) + CLKS_DISPCLK_KHZ, sizeof(dispKHz));
+    memcpy(&dppKHz, static_cast<const UInt8*>(clkMgr) + CLKS_DPPCLK_KHZ, sizeof(dppKHz));
+    // Its guard returns without writing when either clock is 0 (no displays): then what is there is ours.
+    if (dispKHz != 0 && dppKHz != 0) {
+        const auto v = NRed::singleton().readReg32(DENTIST_DISPCLK_CNTL);
+        s.applyDids(v & DENTIST_DISPCLK_WDIVIDER_MASK,
+            (v >> DENTIST_DPPCLK_WDIVIDER_SHIFT) & DENTIST_DISPCLK_WDIVIDER_MASK, true, true);
     }
+    IOLockUnlock(s.clockLock);
+}
+
+// Catches DAL writes that bypass wrapUpdateDentist (or all of them, if it is not routed). Only a field that moved
+// off our last value can be told apart as the DAL's; the DAL writes DISPCLK and DPPCLK separately, so a tick can
+// land between the two.
+void BC250DCN::clockTick()
+{
+    IOLockLock(this->clockLock);
+    const auto v    = NRed::singleton().readReg32(DENTIST_DISPCLK_CNTL);
+    const auto disp = v & DENTIST_DISPCLK_WDIVIDER_MASK;
+    const auto dpp  = (v >> DENTIST_DPPCLK_WDIVIDER_SHIFT) & DENTIST_DISPCLK_WDIVIDER_MASK;
+    if (disp != this->lastDispDid || dpp != this->lastDppDid) {
+        this->applyDids(disp, dpp, disp != this->lastDispDid, dpp != this->lastDppDid);
+    }
+    IOLockUnlock(this->clockLock);
 }
 
 void BC250DCN::clockWatcherMain(void*, int)

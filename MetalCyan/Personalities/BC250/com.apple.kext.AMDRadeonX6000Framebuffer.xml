@@ -41,6 +41,8 @@
 		<dict>
 			<key>CFG_CORRECT_BLPT</key>
 			<true/>
+			<key>CFG_NO_HDCP</key>
+			<true/>
 			<key>CFG_TRANS_WSRV</key>
 			<true/>
 			<key>CFG_UFL_CHK</key>
